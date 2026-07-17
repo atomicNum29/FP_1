@@ -101,7 +101,7 @@ void setup_I2C()
   // Configure I2C
   NRF_TWIM0->PSEL.SCL = (2 << TWIM_PSEL_SCL_PIN_Pos) | (0 << TWIM_PSEL_SCL_PORT_Pos);   // Set SCL pin to P0.02
   NRF_TWIM0->PSEL.SDA = (31 << TWIM_PSEL_SDA_PIN_Pos) | (0 << TWIM_PSEL_SDA_PORT_Pos);  // Set SDA pin to P0.31
-  NRF_TWIM0->FREQUENCY = TWIM_FREQUENCY_FREQUENCY_K100 << TWIM_FREQUENCY_FREQUENCY_Pos; // Set frequency to 100 kHz
+  NRF_TWIM0->FREQUENCY = TWIM_FREQUENCY_FREQUENCY_K400 << TWIM_FREQUENCY_FREQUENCY_Pos; // Set frequency to 100 kHz
   NRF_TWIM0->RXD.PTR = (uint32_t)i2c_rx_buffer;                                         // Set the pointer to the receive buffer
   NRF_TWIM0->RXD.MAXCNT = sizeof(i2c_rx_buffer);
   NRF_TWIM0->RXD.LIST = 0;                      // Disable EasyDMA list for RX
