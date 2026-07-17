@@ -30,6 +30,7 @@ void my_uart_write(uint8_t *data, uint8_t length);
 void setup_QDEC();
 void read_QDEC();                         // Function to read the QDEC value and update the motor_encoder_count variable
 volatile int32_t motor_encoder_count = 0; // Count of motor encoder pulses
+const int32_t pulses_per_revolution = 825; // Number of pulses(steps) per revolution
 
 void setup()
 {
@@ -47,8 +48,8 @@ void loop()
 
   read_QDEC(); // Read the QDEC value and update the motor_encoder_count variable
 
-  uint8_t message[32];
-  sprintf((char *)message, ">ra:%d,ma:%d\r\n", raw_angle, motor_encoder_count); // Convert the raw angle and motor encoder count to a string
+  uint8_t message[64];
+  sprintf((char *)message, ">ra:%d,ma:%ld\r\n", raw_angle, motor_encoder_count); // Convert the raw angle and motor encoder count to a string
   my_uart_write(message, strlen((char *)message));   // Send the raw angle over UART
 
   delay(10);
