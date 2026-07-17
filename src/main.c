@@ -28,27 +28,30 @@ void my_uart_write(uint8_t *data, uint8_t length);
 #define MOTOR_ENCODER_INTERRUPT_PIN_A 21 // P0.21
 #define MOTOR_ENCODER_INTERRUPT_PIN_B 23 // P0.23
 void setup_QDEC();
+void read_QDEC();                         // Function to read the QDEC value and update the motor_encoder_count variable
+volatile int32_t motor_encoder_count = 0; // Count of motor encoder pulses
 
 void setup()
 {
   setup_PWM0();
   setup_I2C();
   setup_UART();
+  setup_QDEC();
 }
 
 void loop()
 {
-  // for (uint16_t i = 0; i < 1000; i++)
-  {
-    uint16_t i = 0x0C;
-    my_i2c_read_register(AS5600_ADDRESS, 0x0E, (uint8_t *)&i, 2); // Read the raw angle from AS5600
-    i = ((i >> 8) | (i << 8)) & 0x0FFF;                           // Convert from big-endian to little-endian
-    // set_PWM0_width(0, i);
-    uint8_t raw_angle[32];
-    sprintf((char *)raw_angle, ">ra:%d\r\n", i);         // Convert the raw angle to a string
-    my_uart_write(raw_angle, strlen((char *)raw_angle)); // Send the raw angle over UART
-    delay(10);
-  }
+  uint16_t raw_angle = 0x0C;
+  my_i2c_read_register(AS5600_ADDRESS, 0x0E, (uint8_t *)&raw_angle, 2); // Read the raw angle from AS5600
+  raw_angle = ((raw_angle >> 8) | (raw_angle << 8)) & 0x0FFF;           // Convert from big-endian to little-endian
+
+  read_QDEC(); // Read the QDEC value and update the motor_encoder_count variable
+
+  uint8_t message[32];
+  sprintf((char *)message, ">ra:%d,ma:%d\r\n", raw_angle, motor_encoder_count); // Convert the raw angle and motor encoder count to a string
+  my_uart_write(message, strlen((char *)message));   // Send the raw angle over UART
+
+  delay(10);
 }
 
 void setup_PWM0()
@@ -205,15 +208,20 @@ void setup_GPIO_interrupt_for_motor_encoder()
                          (GPIOTE_INTENSET_IN1_Enabled << GPIOTE_INTENSET_IN1_Pos); // Enable interrupts for GPIOTE channels 0 and 1
 }
 
-// void setup_QDEC()
-// {
-//   NRF_QDEC->PSEL.A = MOTOR_ENCODER_INTERRUPT_PIN_A; // Set P0.21 as input for channel A
-//   NRF_QDEC->PSEL.B = MOTOR_ENCODER_INTERRUPT_PIN_B; // Set P0.23 as input for channel B
-//   NRF_QDEC->PSEL.LED = (QDEC_PSEL_LED_CONNECT_Disconnected << QDEC_PSEL_LED_CONNECT_Pos); // Disable LED output
-//   NRF_QDEC->PSEL.REPORTPER = QDEC_PSEL_REPORTPER_REPORTPER_10 << QDEC_PSEL_REPORTPER_REPORTPER_Pos; // Set report period to 10 samples
-//   NRF_QDEC->CONFIG = (QDEC_CONFIG_LEDPOL_ActiveHigh << QDEC_CONFIG_LEDPOL_Pos) |
-//                      (QDEC_CONFIG_SAMPLEPER_Sample128us << QDEC_CONFIG_SAMPLEPER_Pos) |
-//                      (QDEC_CONFIG_DBFEN_Enabled << QDEC_CONFIG_DBFEN_Pos); // Enable debouncing and set sample period to 128 us
-//   NRF_QDEC->ENABLE = (QDEC_ENABLE_ENABLE_Enabled << QDEC_ENABLE_ENABLE_Pos); // Enable the QDEC peripheral
-//   NRF_QDEC->TASKS_START = 1; // Start the QDEC
-// }
+void setup_QDEC()
+{
+  NRF_QDEC->PSEL.A = MOTOR_ENCODER_INTERRUPT_PIN_A;                                       // Set P0.21 as input for channel A
+  NRF_QDEC->PSEL.B = MOTOR_ENCODER_INTERRUPT_PIN_B;                                       // Set P0.23 as input for channel B
+  NRF_QDEC->PSEL.LED = (QDEC_PSEL_LED_CONNECT_Disconnected << QDEC_PSEL_LED_CONNECT_Pos); // Disable LED output
+  NRF_QDEC->SAMPLEPER = (QDEC_SAMPLEPER_SAMPLEPER_128us << QDEC_SAMPLEPER_SAMPLEPER_Pos); // Set sample period to 128 us
+  NRF_QDEC->ENABLE = (QDEC_ENABLE_ENABLE_Enabled << QDEC_ENABLE_ENABLE_Pos);              // Enable the QDEC peripheral
+  NRF_QDEC->TASKS_START = 1;                                                              // Start the QDEC
+}
+
+void read_QDEC()
+{
+  // Read the accumulated count from the QDEC
+  NRF_QDEC->TASKS_READCLRACC = 1;           // Trigger the READCLRACC task to read and clear the accumulated count
+  int32_t acc = (int32_t)NRF_QDEC->ACCREAD; // Read the accumulated count
+  motor_encoder_count += acc;               // Update the global variable with the current count
+}
