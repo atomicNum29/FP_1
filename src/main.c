@@ -38,10 +38,16 @@ void setup()
   setup_I2C();
   setup_UART();
   setup_QDEC();
+  NRF_P1->PIN_CNF[2] = (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
+                        (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
+                        (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
+                        (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
+                        (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos); // Set P1.02 as output for LED
 }
 
 void loop()
 {
+  NRF_P1->OUTSET = (1 << 2); // Turn on LED
   uint16_t raw_angle = 0x0C;
   my_i2c_read_register(AS5600_ADDRESS, 0x0E, (uint8_t *)&raw_angle, 2); // Read the raw angle from AS5600
   raw_angle = ((raw_angle >> 8) | (raw_angle << 8)) & 0x0FFF;           // Convert from big-endian to little-endian
@@ -51,7 +57,7 @@ void loop()
   uint8_t message[64];
   sprintf((char *)message, ">ra:%d,ma:%ld\r\n", raw_angle, motor_encoder_count); // Convert the raw angle and motor encoder count to a string
   my_uart_write(message, strlen((char *)message));   // Send the raw angle over UART
-
+  NRF_P1->OUTCLR = (1 << 2); // Turn off LED
   delay(10);
 }
 
