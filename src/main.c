@@ -2,7 +2,7 @@
 #include <nrf52840_bitfields.h>
 #include <stdio.h>
 #include <string.h>
-#include <Arduino.h>
+// #include <Arduino.h>
 
 #define PWM_RAM_POLARITY_Pos (15UL)
 #define PWM_RAM_POLARITY_FALLING_Val ((1U) << PWM_RAM_POLARITY_Pos)
@@ -14,23 +14,30 @@ uint16_t pwm_width[] = {PWM_RAM_POLARITY_FALLING_Val | 0, 0, 0, 0};
 void setup_PWM0();
 void set_PWM0_width(uint8_t channel, uint16_t width);
 
-uint8_t i2c_tx_buffer[10]; // Buffer for I2C data
-uint8_t i2c_rx_buffer[10]; // Buffer for I2C data
+#define AS5600_ADDRESS 0x36 // I2C address of AS5600
+uint8_t i2c_tx_buffer[10];  // Buffer for I2C data
+uint8_t i2c_rx_buffer[10];  // Buffer for I2C data
 void setup_I2C();
 void my_i2c_write(uint8_t address, uint8_t *data, uint8_t length);
 void my_i2c_read(uint8_t address, uint8_t *data, uint8_t length);
 void my_i2c_read_register(uint8_t address, uint8_t reg, uint8_t *data, uint8_t length);
-#define AS5600_ADDRESS 0x36 // I2C address of AS5600
-
-void setup_UART();
-void my_uart_write(uint8_t *data, uint8_t length);
+volatile uint16_t raw_angle = 0; // Raw angle value from AS5600
 
 #define MOTOR_ENCODER_INTERRUPT_PIN_A 21 // P0.21
 #define MOTOR_ENCODER_INTERRUPT_PIN_B 23 // P0.23
 void setup_QDEC();
-void read_QDEC();                         // Function to read the QDEC value and update the motor_encoder_count variable
-volatile int32_t motor_encoder_count = 0; // Count of motor encoder pulses
+void read_QDEC();                          // Function to read the QDEC value and update the motor_encoder_count variable
+volatile int32_t motor_encoder_count = 0;  // Count of motor encoder pulses
 const int32_t pulses_per_revolution = 825; // Number of pulses(steps) per revolution
+
+const int control_period_ms = 10; // Control period in milliseconds
+void setup_timer3_for_control_period();
+void periodic_task();            // Function to be called every control_period_ms milliseconds
+volatile uint8_t timer3_cnt = 0; // Counter for Timer3 interrupts
+
+char uart_buffer[64]; // Buffer for UART data
+void setup_UART();
+void my_uart_write(uint8_t *data, uint8_t length);
 
 void setup()
 {
@@ -38,27 +45,35 @@ void setup()
   setup_I2C();
   setup_UART();
   setup_QDEC();
+  setup_timer3_for_control_period();
   NRF_P1->PIN_CNF[2] = (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
-                        (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
-                        (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
-                        (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
-                        (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos); // Set P1.02 as output for LED
+                       (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
+                       (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
+                       (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
+                       (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos); // Set P1.02 as output for LED
 }
 
 void loop()
 {
+  if (timer3_cnt >= 5) // Check if 5 control periods have passed (50 ms)
+  {
+    timer3_cnt = 0;                                                            // Reset the counter
+    sprintf(uart_buffer, ">ra:%d,ma:%ld\r\n", raw_angle, motor_encoder_count); // Convert the raw angle and motor encoder count to a string
+    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));                // Send the raw angle over UART
+  }
+  __WFI(); // Wait for interrupt
+}
+
+void periodic_task()
+{
   NRF_P1->OUTSET = (1 << 2); // Turn on LED
-  uint16_t raw_angle = 0x0C;
-  my_i2c_read_register(AS5600_ADDRESS, 0x0E, (uint8_t *)&raw_angle, 2); // Read the raw angle from AS5600
-  raw_angle = ((raw_angle >> 8) | (raw_angle << 8)) & 0x0FFF;           // Convert from big-endian to little-endian
+  uint8_t tmp_raw_angle[2];
+  my_i2c_read_register(AS5600_ADDRESS, 0x0C, (uint8_t *)&tmp_raw_angle, 2);      // Read the raw angle from AS5600
+  raw_angle = ((tmp_raw_angle[1]) | ((uint16_t)tmp_raw_angle[0] << 8)) & 0x0FFF; // Convert from big-endian to little-endian
 
   read_QDEC(); // Read the QDEC value and update the motor_encoder_count variable
 
-  uint8_t message[64];
-  sprintf((char *)message, ">ra:%d,ma:%ld\r\n", raw_angle, motor_encoder_count); // Convert the raw angle and motor encoder count to a string
-  my_uart_write(message, strlen((char *)message));   // Send the raw angle over UART
   NRF_P1->OUTCLR = (1 << 2); // Turn off LED
-  delay(10);
 }
 
 void setup_PWM0()
@@ -231,4 +246,30 @@ void read_QDEC()
   NRF_QDEC->TASKS_READCLRACC = 1;           // Trigger the READCLRACC task to read and clear the accumulated count
   int32_t acc = (int32_t)NRF_QDEC->ACCREAD; // Read the accumulated count
   motor_encoder_count += acc;               // Update the global variable with the current count
+}
+
+void TIMER3_IRQHandler(void)
+{
+  if (NRF_TIMER3->EVENTS_COMPARE[0])
+  {
+    NRF_TIMER3->EVENTS_COMPARE[0] = 0; // Clear the compare event
+    periodic_task();                   // Call the periodic task function
+    timer3_cnt++;                      // Increment the timer3 counter
+  }
+  return;
+}
+
+void setup_timer3_for_control_period()
+{
+  NRF_TIMER3->MODE = TIMER_MODE_MODE_Timer << TIMER_MODE_MODE_Pos;                             // Set timer mode
+  NRF_TIMER3->BITMODE = TIMER_BITMODE_BITMODE_16Bit << TIMER_BITMODE_BITMODE_Pos;              // Set bit mode to 16 bits
+  NRF_TIMER3->PRESCALER = 4;                                                                   // Set prescaler to 4 (1 MHz timer frequency)
+  NRF_TIMER3->CC[0] = control_period_ms * 1000;                                                // Set compare value for the control period
+  NRF_TIMER3->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos; // Enable shortcut to clear timer on compare match
+  NRF_TIMER3->INTENSET = TIMER_INTENSET_COMPARE0_Enabled << TIMER_INTENSET_COMPARE0_Pos;       // Enable interrupt on compare match
+  NVIC_ClearPendingIRQ(TIMER3_IRQn);                                                           // Clear any pending interrupts for Timer3
+  NVIC_SetPriority(TIMER3_IRQn, 2);                                                            // Set priority for Timer3 interrupt
+  __NVIC_SetVector(TIMER3_IRQn, (uint32_t)TIMER3_IRQHandler);                                  // Set the interrupt vector for Timer3
+  NVIC_EnableIRQ(TIMER3_IRQn);                                                                 // Enable Timer3 interrupt in NVIC
+  NRF_TIMER3->TASKS_START = 1;                                                                 // Start the timer
 }
