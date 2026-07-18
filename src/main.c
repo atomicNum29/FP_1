@@ -13,6 +13,8 @@ uint16_t pwm_width[] = {PWM_RAM_POLARITY_FALLING_Val | 0, 0, 0, 0};
 
 void setup_PWM0();
 void set_PWM0_width(uint8_t channel, uint16_t width);
+void setup_GPIO_for_dir();
+void set_GPIO_for_dir(int8_t dir);
 
 #define AS5600_ADDRESS 0x36 // I2C address of AS5600
 uint8_t i2c_tx_buffer[10];  // Buffer for I2C data
@@ -30,7 +32,7 @@ void read_QDEC();                          // Function to read the QDEC value an
 volatile int32_t motor_encoder_count = 0;  // Count of motor encoder pulses
 const int32_t pulses_per_revolution = 825; // Number of pulses(steps) per revolution
 
-const int control_period_ms = 10; // Control period in milliseconds
+const int control_period_ms = 2; // Control period in milliseconds
 void setup_timer3_for_control_period();
 void periodic_task();            // Function to be called every control_period_ms milliseconds
 volatile uint8_t timer3_cnt = 0; // Counter for Timer3 interrupts
@@ -42,6 +44,7 @@ void my_uart_write(uint8_t *data, uint8_t length);
 void setup()
 {
   setup_PWM0();
+  setup_GPIO_for_dir();
   setup_I2C();
   setup_UART();
   setup_QDEC();
@@ -55,7 +58,7 @@ void setup()
 
 void loop()
 {
-  if (timer3_cnt >= 5) // Check if 5 control periods have passed (50 ms)
+  if (timer3_cnt >= 5) // Check if 5 control periods have passed (10 ms)
   {
     timer3_cnt = 0;                                                            // Reset the counter
     sprintf(uart_buffer, ">ra:%d,ma:%ld\r\n", raw_angle, motor_encoder_count); // Convert the raw angle and motor encoder count to a string
@@ -72,6 +75,41 @@ void periodic_task()
   raw_angle = ((tmp_raw_angle[1]) | ((uint16_t)tmp_raw_angle[0] << 8)) & 0x0FFF; // Convert from big-endian to little-endian
 
   read_QDEC(); // Read the QDEC value and update the motor_encoder_count variable
+
+  float error = (float)raw_angle - (float)motor_encoder_count;         // Calculate the error between the raw angle and motor encoder count
+  float derivative = 0;                                                // Calculate the derivative of the error
+  static float previous_error = 0;                                     // Store the previous error for derivative calculation
+  derivative = error - previous_error;                                 // Calculate the derivative of the error
+  previous_error = error;                                              // Update the previous error
+  float integral = 0;                                                  // Calculate the integral of the error
+  static float previous_integral = 0;                                  // Store the previous integral for integral calculation
+  integral = previous_integral + error * (control_period_ms / 1000.0); // Calculate the integral of the error
+  previous_integral = integral;                                        // Update the previous integral
+
+  float Kp = 3.0; // Proportional gain
+  float Kd = 0.0; // Derivative gain
+  float Ki = 0.5; // Integral gain
+
+  float pid_output = Kp * error + Kd * derivative + Ki * integral;
+
+  uint32_t pwm_value = 0; // Calculate the PWM value based on the error
+
+  if (pid_output > 0)
+  {
+    set_GPIO_for_dir(1);         // Set the direction of the motor
+    pwm_value = (uint16_t)pid_output; // Set the PWM value based on the error
+  }
+  else
+  {
+    set_GPIO_for_dir(-1);           // Set the direction of the motor
+    pwm_value = (uint16_t)(-pid_output); // Set the PWM value based on the error
+  }
+
+  pwm_value *= 10; // Scale the PWM value to increase the speed of the motor
+
+  pwm_value = (pwm_value > 1000) ? 1000 : pwm_value; // Limit the PWM value to the maximum value of the counter
+
+  set_PWM0_width(0, pwm_value / 2); // Set the PWM width for channel 0
 
   NRF_P1->OUTCLR = (1 << 2); // Turn off LED
 }
@@ -115,6 +153,39 @@ void set_PWM0_width(uint8_t channel, uint16_t width)
     pwm_width[channel] = PWM_RAM_POLARITY_FALLING_Val | (width & PWM_RAM_COMPARE_Msk);
   }
   NRF_PWM0->TASKS_SEQSTART[0] = 1; // Start the sequence
+}
+
+void setup_GPIO_for_dir()
+{
+  NRF_P1->PIN_CNF[15] = (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
+                        (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
+                        (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
+                        (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
+                        (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos); // Set P1.15 as output for direction
+  NRF_P1->PIN_CNF[13] = (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
+                        (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
+                        (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
+                        (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
+                        (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos); // Set P1.13 as output for direction
+  NRF_P1->OUTCLR = (1 << 15) | (1 << 13);                                        // Clear P1.15 and P1.13 outputs
+}
+
+void set_GPIO_for_dir(int8_t dir)
+{
+  if (dir > 0)
+  {
+    NRF_P1->OUTSET = (1 << 15); // Set P1.15 high for forward direction
+    NRF_P1->OUTCLR = (1 << 13); // Set P1.13 low for forward direction
+  }
+  else if (dir < 0)
+  {
+    NRF_P1->OUTCLR = (1 << 15); // Set P1.15 low for reverse direction
+    NRF_P1->OUTSET = (1 << 13); // Set P1.13 high for reverse direction
+  }
+  else
+  {
+    NRF_P1->OUTCLR = (1 << 15) | (1 << 13); // Set both P1.15 and P1.13 low for stop
+  }
 }
 
 void setup_I2C()
