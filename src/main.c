@@ -48,6 +48,11 @@ char uart_buffer[64]; // Buffer for UART data
 void setup_UART();
 void my_uart_write(uint8_t *data, uint8_t length);
 
+#define BUTTON_PIN 27 // P0.27
+void setup_GPIO_interrupt_for_button();
+
+volatile uint8_t state = 0; // State variable for the main loop
+
 void setup()
 {
   setup_PWM0();
@@ -57,6 +62,7 @@ void setup()
   setup_AS5600();
   setup_QDEC();
   setup_timer3_for_control_period();
+  setup_GPIO_interrupt_for_button();
   NRF_P1->PIN_CNF[2] = (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
                        (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
                        (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
@@ -82,7 +88,30 @@ void periodic_task()
   read_AS5600_angle_deg(); // Read the angle in degrees from AS5600 and update the pole_angle variable
   read_QDEC();             // Read the QDEC value and update the motor_encoder_count variable
 
-  float error = pole_angle - motor_angle;                              // Calculate the error between the pole angle and motor angle
+  float target_angle = 0.0; // Target angle in degrees (upright position)
+
+  switch (state)
+  {
+  case 0:                    // State 0: Pole is upright, motor is stopped
+    target_angle = -30.0;    // Target angle is -30 degrees (ready for swing)
+    if (motor_angle < -29.0) // If the motor angle is less than -29.0 degrees, switch to state 1
+    {
+      state = 1;
+    }
+    break;
+  case 1:                   // State 1: Pole is falling, motor is moving to correct
+    target_angle = 30.0;    // Target angle is 0 degrees (upright position)
+    if (motor_angle > 29.0) // If the motor angle is greater than 29.0 degrees, switch to state 2
+    {
+      state = 2;
+    }
+    break;
+  default:
+    target_angle = 0.0; // Default target angle is 0 degrees (upright position)
+    break;
+  }
+
+  float error = target_angle - motor_angle;                            // Calculate the error between the pole angle and motor angle
   float derivative = 0;                                                // Calculate the derivative of the error
   static float previous_error = 0;                                     // Store the previous error for derivative calculation
   derivative = error - previous_error;                                 // Calculate the derivative of the error
@@ -92,9 +121,9 @@ void periodic_task()
   integral = previous_integral + error * (control_period_ms / 1000.0); // Calculate the integral of the error
   previous_integral = integral;                                        // Update the previous integral
 
-  float Kp = 3.0; // Proportional gain
-  float Kd = 0.0; // Derivative gain
-  float Ki = 0.5; // Integral gain
+  float Kp = 10.0; // Proportional gain
+  float Kd = 0.0;  // Derivative gain
+  float Ki = 0.0;  // Integral gain
 
   float pid_output = Kp * error + Kd * derivative + Ki * integral;
 
@@ -306,38 +335,6 @@ void my_uart_write(uint8_t *data, uint8_t length)
   NRF_UARTE0->EVENTS_ENDTX = 0; // Clear the end event
 }
 
-void setup_GPIO_interrupt_for_motor_encoder()
-{
-  NRF_P0->PIN_CNF[MOTOR_ENCODER_INTERRUPT_PIN_A] =
-      (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos) |
-      (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
-      (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
-      (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-      (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos); // Configure P0.21 as input with pull-up and sense for low level
-  NRF_P0->PIN_CNF[MOTOR_ENCODER_INTERRUPT_PIN_B] =
-      (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos) |
-      (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
-      (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
-      (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-      (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos); // Configure P0.23 as input with pull-up and sense for low level
-
-  NRF_GPIOTE->CONFIG[0] =
-      (GPIOTE_CONFIG_MODE_Event << GPIOTE_CONFIG_MODE_Pos) |
-      (MOTOR_ENCODER_INTERRUPT_PIN_A << GPIOTE_CONFIG_PSEL_Pos) |
-      (0 << GPIOTE_CONFIG_PORT_Pos) |
-      (GPIOTE_CONFIG_POLARITY_Toggle << GPIOTE_CONFIG_POLARITY_Pos) |
-      (GPIOTE_CONFIG_OUTINIT_Low << GPIOTE_CONFIG_OUTINIT_Pos); // Configure GPIOTE channel 0 for P0.21 with toggle polarity
-  NRF_GPIOTE->CONFIG[1] =
-      (GPIOTE_CONFIG_MODE_Event << GPIOTE_CONFIG_MODE_Pos) |
-      (MOTOR_ENCODER_INTERRUPT_PIN_B << GPIOTE_CONFIG_PSEL_Pos) |
-      (0 << GPIOTE_CONFIG_PORT_Pos) |
-      (GPIOTE_CONFIG_POLARITY_Toggle << GPIOTE_CONFIG_POLARITY_Pos) |
-      (GPIOTE_CONFIG_OUTINIT_Low << GPIOTE_CONFIG_OUTINIT_Pos); // Configure GPIOTE channel 1 for P0.23 with toggle polarity
-
-  NRF_GPIOTE->INTENSET = (GPIOTE_INTENSET_IN0_Enabled << GPIOTE_INTENSET_IN0_Pos) |
-                         (GPIOTE_INTENSET_IN1_Enabled << GPIOTE_INTENSET_IN1_Pos); // Enable interrupts for GPIOTE channels 0 and 1
-}
-
 void setup_QDEC()
 {
   NRF_QDEC->PSEL.A = MOTOR_ENCODER_INTERRUPT_PIN_A;                                       // Set P0.21 as input for channel A
@@ -377,8 +374,38 @@ void setup_timer3_for_control_period()
   NRF_TIMER3->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos; // Enable shortcut to clear timer on compare match
   NRF_TIMER3->INTENSET = TIMER_INTENSET_COMPARE0_Enabled << TIMER_INTENSET_COMPARE0_Pos;       // Enable interrupt on compare match
   NVIC_ClearPendingIRQ(TIMER3_IRQn);                                                           // Clear any pending interrupts for Timer3
-  NVIC_SetPriority(TIMER3_IRQn, 2);                                                            // Set priority for Timer3 interrupt
+  NVIC_SetPriority(TIMER3_IRQn, 1);                                                            // Set priority for Timer3 interrupt
   __NVIC_SetVector(TIMER3_IRQn, (uint32_t)TIMER3_IRQHandler);                                  // Set the interrupt vector for Timer3
   NVIC_EnableIRQ(TIMER3_IRQn);                                                                 // Enable Timer3 interrupt in NVIC
   NRF_TIMER3->TASKS_START = 1;                                                                 // Start the timer
+}
+
+void my_GPIOTE_IRQHandler(void)
+{
+  if (NRF_GPIOTE->EVENTS_IN[0])
+  {
+    NRF_GPIOTE->EVENTS_IN[0] = 0; // Clear the event
+    state = 0;                    // Reset the state to 0 when the button is pressed
+  }
+}
+
+void setup_GPIO_interrupt_for_button()
+{
+  NRF_P0->PIN_CNF[BUTTON_PIN] =
+      (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos) |
+      (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
+      (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
+      (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+      (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos); // Configure P0.27 as input with pull-up and sense for low level
+  NRF_GPIOTE->CONFIG[0] =
+      (GPIOTE_CONFIG_MODE_Event << GPIOTE_CONFIG_MODE_Pos) |
+      (BUTTON_PIN << GPIOTE_CONFIG_PSEL_Pos) |
+      (0 << GPIOTE_CONFIG_PORT_Pos) |
+      (GPIOTE_CONFIG_POLARITY_HiToLo << GPIOTE_CONFIG_POLARITY_Pos) |
+      (GPIOTE_CONFIG_OUTINIT_Low << GPIOTE_CONFIG_OUTINIT_Pos);                    // Configure GPIOTE channel 0 for P0.27 with HiToLo polarity (falling edge)
+  NRF_GPIOTE->INTENSET = (GPIOTE_INTENSET_IN0_Enabled << GPIOTE_INTENSET_IN0_Pos); // Enable interrupt for GPIOTE channel 0
+  NVIC_ClearPendingIRQ(GPIOTE_IRQn);                                               // Clear any pending interrupts for GPIOTE
+  NVIC_SetPriority(GPIOTE_IRQn, 2);                                                // Set priority for GPIOTE interrupt
+  __NVIC_SetVector(GPIOTE_IRQn, (uint32_t)my_GPIOTE_IRQHandler);                      // Set the interrupt vector for GPIOTE
+  NVIC_EnableIRQ(GPIOTE_IRQn);                                                     // Enable GPIOTE interrupt in NVIC
 }
