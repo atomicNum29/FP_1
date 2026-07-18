@@ -23,7 +23,13 @@ void setup_I2C();
 void my_i2c_write(uint8_t address, uint8_t *data, uint8_t length);
 void my_i2c_read(uint8_t address, uint8_t *data, uint8_t length);
 void my_i2c_read_register(uint8_t address, uint8_t reg, uint8_t *data, uint8_t length);
-volatile uint16_t raw_angle = 0; // Raw angle value from AS5600
+void setup_AS5600();                   // Function to setup AS5600
+void read_AS5600_raw_angle();          // Function to read the raw angle from AS5600 and update the raw_angle variable
+void read_AS5600_angle_deg();          // Function to read the angle in degrees from AS5600 and update the pole_angle variable
+volatile uint16_t raw_angle = 0;       // Raw angle value from AS5600
+volatile uint16_t raw_angle_zero = 0;  // Raw angle value from AS5600 at zero position
+volatile int32_t raw_angle_offset = 0; // Raw angle offset value from AS5600
+volatile float pole_angle = 0.0;       // Angle in degrees from AS5600
 
 #define MOTOR_ENCODER_INTERRUPT_PIN_A 21 // P0.21
 #define MOTOR_ENCODER_INTERRUPT_PIN_B 23 // P0.23
@@ -31,6 +37,7 @@ void setup_QDEC();
 void read_QDEC();                          // Function to read the QDEC value and update the motor_encoder_count variable
 volatile int32_t motor_encoder_count = 0;  // Count of motor encoder pulses
 const int32_t pulses_per_revolution = 825; // Number of pulses(steps) per revolution
+volatile float motor_angle = 0.0;          // Angle in degrees from motor encoder
 
 const int control_period_ms = 2; // Control period in milliseconds
 void setup_timer3_for_control_period();
@@ -45,8 +52,9 @@ void setup()
 {
   setup_PWM0();
   setup_GPIO_for_dir();
-  setup_I2C();
   setup_UART();
+  setup_I2C();
+  setup_AS5600();
   setup_QDEC();
   setup_timer3_for_control_period();
   NRF_P1->PIN_CNF[2] = (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
@@ -60,9 +68,9 @@ void loop()
 {
   if (timer3_cnt >= 5) // Check if 5 control periods have passed (10 ms)
   {
-    timer3_cnt = 0;                                                            // Reset the counter
-    sprintf(uart_buffer, ">ra:%d,ma:%ld\r\n", raw_angle, motor_encoder_count); // Convert the raw angle and motor encoder count to a string
-    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));                // Send the raw angle over UART
+    timer3_cnt = 0;                                                        // Reset the counter
+    sprintf(uart_buffer, ">pa:%.2f,ma:%.2f\r\n", pole_angle, motor_angle); // Convert the pole angle and motor angle to a string
+    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));            // Send the pole angle over UART
   }
   __WFI(); // Wait for interrupt
 }
@@ -70,13 +78,11 @@ void loop()
 void periodic_task()
 {
   NRF_P1->OUTSET = (1 << 2); // Turn on LED
-  uint8_t tmp_raw_angle[2];
-  my_i2c_read_register(AS5600_ADDRESS, 0x0C, (uint8_t *)&tmp_raw_angle, 2);      // Read the raw angle from AS5600
-  raw_angle = ((tmp_raw_angle[1]) | ((uint16_t)tmp_raw_angle[0] << 8)) & 0x0FFF; // Convert from big-endian to little-endian
 
-  read_QDEC(); // Read the QDEC value and update the motor_encoder_count variable
+  read_AS5600_angle_deg(); // Read the angle in degrees from AS5600 and update the pole_angle variable
+  read_QDEC();             // Read the QDEC value and update the motor_encoder_count variable
 
-  float error = (float)raw_angle - (float)motor_encoder_count;         // Calculate the error between the raw angle and motor encoder count
+  float error = pole_angle - motor_angle;                              // Calculate the error between the pole angle and motor angle
   float derivative = 0;                                                // Calculate the derivative of the error
   static float previous_error = 0;                                     // Store the previous error for derivative calculation
   derivative = error - previous_error;                                 // Calculate the derivative of the error
@@ -96,20 +102,18 @@ void periodic_task()
 
   if (pid_output > 0)
   {
-    set_GPIO_for_dir(1);         // Set the direction of the motor
+    set_GPIO_for_dir(1);              // Set the direction of the motor
     pwm_value = (uint16_t)pid_output; // Set the PWM value based on the error
   }
   else
   {
-    set_GPIO_for_dir(-1);           // Set the direction of the motor
+    set_GPIO_for_dir(-1);                // Set the direction of the motor
     pwm_value = (uint16_t)(-pid_output); // Set the PWM value based on the error
   }
 
-  pwm_value *= 10; // Scale the PWM value to increase the speed of the motor
-
   pwm_value = (pwm_value > 1000) ? 1000 : pwm_value; // Limit the PWM value to the maximum value of the counter
 
-  set_PWM0_width(0, pwm_value / 2); // Set the PWM width for channel 0
+  set_PWM0_width(0, pwm_value); // Set the PWM width for channel 0
 
   NRF_P1->OUTCLR = (1 << 2); // Turn off LED
 }
@@ -244,6 +248,39 @@ void my_i2c_read_register(uint8_t address, uint8_t reg, uint8_t *data, uint8_t l
                       (TWIM_SHORTS_LASTRX_STOP_Enabled << TWIM_SHORTS_LASTRX_STOP_Pos); // Restore shorts for automatic stop after last TX/RX
 }
 
+void setup_AS5600()
+{
+  uint32_t angle_sum = 0;
+  for (size_t i = 0; i < 10; i++)
+  {
+    read_AS5600_raw_angle(); // Read the raw angle from AS5600 and update the raw_angle variable
+    angle_sum += raw_angle;  // Accumulate the raw angle values
+  }
+  raw_angle_zero = angle_sum / 10; // Calculate the average raw angle value for zero position
+}
+
+void read_AS5600_raw_angle()
+{
+  uint8_t tmp_raw_angle[2];
+  my_i2c_read_register(AS5600_ADDRESS, 0x0C, (uint8_t *)&tmp_raw_angle, 2);      // Read the raw angle from AS5600
+  raw_angle = ((tmp_raw_angle[1]) | ((uint16_t)tmp_raw_angle[0] << 8)) & 0x0FFF; // Convert from big-endian to little-endian
+}
+
+void read_AS5600_angle_deg()
+{
+  uint16_t prev_raw_angle = raw_angle;
+  read_AS5600_raw_angle();                                             // Read the raw angle from AS5600 and update the raw_angle variable
+  if (raw_angle < prev_raw_angle && prev_raw_angle - raw_angle > 2048) // Handle wrap-around from 4095 to 0
+  {
+    raw_angle_offset += 4096; // Adjust the zero position to account for wrap-around
+  }
+  else if (prev_raw_angle < raw_angle && raw_angle - prev_raw_angle > 2048) // Handle wrap-around from 0 to 4095
+  {
+    raw_angle_offset -= 4096; // Adjust the zero position to account for wrap-around
+  }
+  pole_angle = (((float)raw_angle - raw_angle_zero + raw_angle_offset) / 4096.0) * 360.0; // Convert the raw angle to degrees
+}
+
 void setup_UART()
 {
   // Configure UART
@@ -314,9 +351,10 @@ void setup_QDEC()
 void read_QDEC()
 {
   // Read the accumulated count from the QDEC
-  NRF_QDEC->TASKS_READCLRACC = 1;           // Trigger the READCLRACC task to read and clear the accumulated count
-  int32_t acc = (int32_t)NRF_QDEC->ACCREAD; // Read the accumulated count
-  motor_encoder_count += acc;               // Update the global variable with the current count
+  NRF_QDEC->TASKS_READCLRACC = 1;                                             // Trigger the READCLRACC task to read and clear the accumulated count
+  int32_t acc = (int32_t)NRF_QDEC->ACCREAD;                                   // Read the accumulated count
+  motor_encoder_count += acc;                                                 // Update the global variable with the current count
+  motor_angle = ((float)motor_encoder_count / pulses_per_revolution) * 360.0; // Convert the count to degrees
 }
 
 void TIMER3_IRQHandler(void)
