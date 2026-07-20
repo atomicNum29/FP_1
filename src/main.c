@@ -15,6 +15,8 @@ void setup_PWM0();
 void set_PWM0_width(uint8_t channel, uint16_t width);
 void setup_GPIO_for_dir();
 void set_GPIO_for_dir(int8_t dir);
+const uint16_t PWM_MIN_WIDTH = 70;   // Minimum PWM width (7% duty cycle)
+const uint16_t PWM_MAX_WIDTH = 1000; // Maximum PWM width (100% duty cycle)
 
 #define AS5600_ADDRESS 0x36 // I2C address of AS5600
 uint8_t i2c_tx_buffer[10];  // Buffer for I2C data
@@ -38,6 +40,8 @@ void read_QDEC();                          // Function to read the QDEC value an
 volatile int32_t motor_encoder_count = 0;  // Count of motor encoder pulses
 const int32_t pulses_per_revolution = 825; // Number of pulses(steps) per revolution
 volatile float motor_angle = 0.0;          // Angle in degrees from motor encoder
+const float MOTOR_ANGLE_MIN = -45.0;       // Minimum angle in degrees from motor encoder
+const float MOTOR_ANGLE_MAX = 45.0;        // Maximum angle in degrees from motor encoder
 
 const int control_period_ms = 2; // Control period in milliseconds
 void setup_timer3_for_control_period();
@@ -51,7 +55,15 @@ void my_uart_write(uint8_t *data, uint8_t length);
 #define BUTTON_PIN 27 // P0.27
 void setup_GPIO_interrupt_for_button();
 
-volatile uint8_t state = 0; // State variable for the main loop
+typedef enum _State
+{
+  STATE_INIT = 0,
+  STATE_MOVE_TO_NEGATIVE_ANGLE = 1,
+  STATE_MOVE_TO_POSITIVE_ANGLE = 2,
+  STATE_MOVE_TO_ZERO_ANGLE = 3
+} State;
+volatile State state = 0; // State variable for the main loop
+float target_angle = 0.0; // Target angle in degrees (upright position)
 
 void setup()
 {
@@ -74,9 +86,9 @@ void loop()
 {
   if (timer3_cnt >= 5) // Check if 5 control periods have passed (10 ms)
   {
-    timer3_cnt = 0;                                                        // Reset the counter
-    sprintf(uart_buffer, ">pa:%.2f,ma:%.2f\r\n", pole_angle, motor_angle); // Convert the pole angle and motor angle to a string
-    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));            // Send the pole angle over UART
+    timer3_cnt = 0;                                                                              // Reset the counter
+    sprintf(uart_buffer, ">pa:%.2f,ma:%.2f,mt:%.2f\r\n", pole_angle, motor_angle, target_angle); // Convert the pole angle and motor angle to a string
+    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));                                  // Send the pole angle over UART
   }
   __WFI(); // Wait for interrupt
 }
@@ -86,43 +98,60 @@ void periodic_task()
   NRF_P1->OUTSET = (1 << 2); // Turn on LED
 
   read_AS5600_angle_deg(); // Read the angle in degrees from AS5600 and update the pole_angle variable
-  read_QDEC();             // Read the QDEC value and update the motor_encoder_count variable
+  read_QDEC(); // Read the QDEC value and update the motor_encoder_count variable
 
-  float target_angle = 0.0; // Target angle in degrees (upright position)
-
-  switch (state)
+  if (state == STATE_INIT)
   {
-  case 0:                    // State 0: Pole is upright, motor is stopped
-    target_angle = -30.0;    // Target angle is -30 degrees (ready for swing)
-    if (motor_angle < -29.0) // If the motor angle is less than -29.0 degrees, switch to state 1
+    // static uint32_t cnt = 0;
+    // if (cnt == 10000)
+    // {
+    //   state = 10; // Change state to 10 when the button is pressed
+    // }
+    // cnt++;
+    // set_GPIO_for_dir(1); // Stop the motor
+    // set_PWM0_width(0, cnt / 100);
+    // return;
+    state = STATE_MOVE_TO_NEGATIVE_ANGLE; // Change state to MOVE_TO_NEGATIVE_ANGLE when the button is pressed
+  }
+  else if (state == STATE_MOVE_TO_NEGATIVE_ANGLE)
+  {
+    target_angle = MOTOR_ANGLE_MIN; // Set the target angle to the minimum motor angle
+    if (motor_angle < MOTOR_ANGLE_MIN + 0.1)
     {
-      state = 1;
+      state = STATE_MOVE_TO_POSITIVE_ANGLE; // Change state to MOVE_TO_POSITIVE_ANGLE when the motor angle is less than the minimum angle
     }
-    break;
-  case 1:                   // State 1: Pole is falling, motor is moving to correct
-    target_angle = 30.0;    // Target angle is 0 degrees (upright position)
-    if (motor_angle > 29.0) // If the motor angle is greater than 29.0 degrees, switch to state 2
+  }
+  else if (state == STATE_MOVE_TO_POSITIVE_ANGLE)
+  {
+    target_angle = MOTOR_ANGLE_MAX; // Set the target angle to the maximum motor angle
+    if (motor_angle > MOTOR_ANGLE_MAX - 0.1)
     {
-      state = 2;
+      state = STATE_MOVE_TO_ZERO_ANGLE; // Change state to MOVE_TO_ZERO_ANGLE when the motor angle is greater than the maximum angle
     }
-    break;
-  default:
-    target_angle = 0.0; // Default target angle is 0 degrees (upright position)
-    break;
+  }
+  else if (state == STATE_MOVE_TO_ZERO_ANGLE)
+  {
+    target_angle = 0.0; // Set the target angle to 0 degrees
+  }
+  else
+  {
+    set_GPIO_for_dir(0); // Stop the motor
+    set_PWM0_width(0, 0);
+    return; // Do nothing if the state is undefined
   }
 
-  float error = target_angle - motor_angle;                            // Calculate the error between the pole angle and motor angle
-  float derivative = 0;                                                // Calculate the derivative of the error
-  static float previous_error = 0;                                     // Store the previous error for derivative calculation
-  derivative = error - previous_error;                                 // Calculate the derivative of the error
-  previous_error = error;                                              // Update the previous error
-  float integral = 0;                                                  // Calculate the integral of the error
-  static float previous_integral = 0;                                  // Store the previous integral for integral calculation
-  integral = previous_integral + error * (control_period_ms / 1000.0); // Calculate the integral of the error
-  previous_integral = integral;                                        // Update the previous integral
+  float error = target_angle - motor_angle;                             // Calculate the error between the pole angle and motor angle
+  float derivative = 0;                                                 // Calculate the derivative of the error
+  static float previous_error = 0;                                      // Store the previous error for derivative calculation
+  derivative = (error - previous_error) / (control_period_ms / 1000.0); // Calculate the derivative of the error
+  previous_error = error;                                               // Update the previous error
+  float integral = 0;                                                   // Calculate the integral of the error
+  static float previous_integral = 0;                                   // Store the previous integral for integral calculation
+  integral = previous_integral + error * (control_period_ms / 1000.0);  // Calculate the integral of the error
+  previous_integral = integral;                                         // Update the previous integral
 
   float Kp = 10.0; // Proportional gain
-  float Kd = 0.0;  // Derivative gain
+  float Kd = 0.5;  // Derivative gain
   float Ki = 0.0;  // Integral gain
 
   float pid_output = Kp * error + Kd * derivative + Ki * integral;
@@ -140,7 +169,8 @@ void periodic_task()
     pwm_value = (uint16_t)(-pid_output); // Set the PWM value based on the error
   }
 
-  pwm_value = (pwm_value > 1000) ? 1000 : pwm_value; // Limit the PWM value to the maximum value of the counter
+  pwm_value = (pwm_value > PWM_MAX_WIDTH) ? PWM_MAX_WIDTH : pwm_value;              // Limit the PWM value to the maximum value of the counter
+  pwm_value = (pwm_value && pwm_value < PWM_MIN_WIDTH) ? PWM_MIN_WIDTH : pwm_value; // Limit the PWM value to the minimum value of the counter
 
   set_PWM0_width(0, pwm_value); // Set the PWM width for channel 0
 
@@ -162,7 +192,7 @@ void setup_PWM0()
   NRF_PWM0->ENABLE = (PWM_ENABLE_ENABLE_Enabled << PWM_ENABLE_ENABLE_Pos);
   NRF_PWM0->MODE = PWM_MODE_UPDOWN_Up << PWM_MODE_UPDOWN_Pos;
   NRF_PWM0->PRESCALER = PWM_PRESCALER_PRESCALER_DIV_1 << PWM_PRESCALER_PRESCALER_Pos; // Set prescaler to 1 (16 MHz)
-  NRF_PWM0->COUNTERTOP = 1000;                                                        // Set the period of the PWM signal, which is the maximum value of the counter. This will give a PWM frequency of 16 kHz (16 MHz / 1000).
+  NRF_PWM0->COUNTERTOP = PWM_MAX_WIDTH;                                               // Set the period of the PWM signal, which is the maximum value of the counter. This will give a PWM frequency of 16 kHz (16 MHz / 1000).
   NRF_PWM0->LOOP = (PWM_LOOP_CNT_Disabled << PWM_LOOP_CNT_Pos);                       // Disable looping
   NRF_PWM0->DECODER = (PWM_DECODER_LOAD_Individual << PWM_DECODER_LOAD_Pos) |
                       (PWM_DECODER_MODE_RefreshCount << PWM_DECODER_MODE_Pos); // Set the decoder to load individual values for each channel and refresh the counter after each period.
@@ -179,9 +209,9 @@ void set_PWM0_width(uint8_t channel, uint16_t width)
 {
   if (channel < 4)
   {
-    if (width > 1000)
+    if (width > PWM_MAX_WIDTH)
     {
-      width = 1000; // Limit the width to the maximum value of the counter
+      width = PWM_MAX_WIDTH; // Limit the width to the maximum value of the counter
     }
     pwm_width[channel] = PWM_RAM_POLARITY_FALLING_Val | (width & PWM_RAM_COMPARE_Msk);
   }
@@ -385,7 +415,7 @@ void my_GPIOTE_IRQHandler(void)
   if (NRF_GPIOTE->EVENTS_IN[0])
   {
     NRF_GPIOTE->EVENTS_IN[0] = 0; // Clear the event
-    state = 0;                    // Reset the state to 0 when the button is pressed
+    state = STATE_INIT;           // Reset the state to INIT when the button is pressed
   }
 }
 
@@ -406,6 +436,6 @@ void setup_GPIO_interrupt_for_button()
   NRF_GPIOTE->INTENSET = (GPIOTE_INTENSET_IN0_Enabled << GPIOTE_INTENSET_IN0_Pos); // Enable interrupt for GPIOTE channel 0
   NVIC_ClearPendingIRQ(GPIOTE_IRQn);                                               // Clear any pending interrupts for GPIOTE
   NVIC_SetPriority(GPIOTE_IRQn, 2);                                                // Set priority for GPIOTE interrupt
-  __NVIC_SetVector(GPIOTE_IRQn, (uint32_t)my_GPIOTE_IRQHandler);                      // Set the interrupt vector for GPIOTE
+  __NVIC_SetVector(GPIOTE_IRQn, (uint32_t)my_GPIOTE_IRQHandler);                   // Set the interrupt vector for GPIOTE
   NVIC_EnableIRQ(GPIOTE_IRQn);                                                     // Enable GPIOTE interrupt in NVIC
 }
