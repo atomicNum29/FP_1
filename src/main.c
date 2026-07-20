@@ -32,6 +32,7 @@ volatile uint16_t raw_angle = 0;       // Raw angle value from AS5600
 volatile uint16_t raw_angle_zero = 0;  // Raw angle value from AS5600 at zero position
 volatile int32_t raw_angle_offset = 0; // Raw angle offset value from AS5600
 volatile float pole_angle = 0.0;       // Angle in degrees from AS5600
+volatile float pole_angle_d = 0.0;     // Angle velocity in degrees per second from AS5600
 
 #define MOTOR_ENCODER_INTERRUPT_PIN_A 21 // P0.21
 #define MOTOR_ENCODER_INTERRUPT_PIN_B 23 // P0.23
@@ -40,6 +41,7 @@ void read_QDEC();                          // Function to read the QDEC value an
 volatile int32_t motor_encoder_count = 0;  // Count of motor encoder pulses
 const int32_t pulses_per_revolution = 825; // Number of pulses(steps) per revolution
 volatile float motor_angle = 0.0;          // Angle in degrees from motor encoder
+volatile float motor_angle_d = 0.0;        // Angle velocity in degrees per second from motor encoder
 const float MOTOR_ANGLE_MIN = -45.0;       // Minimum angle in degrees from motor encoder
 const float MOTOR_ANGLE_MAX = 45.0;        // Maximum angle in degrees from motor encoder
 
@@ -60,7 +62,10 @@ typedef enum _State
   STATE_INIT = 0,
   STATE_MOVE_TO_NEGATIVE_ANGLE = 1,
   STATE_MOVE_TO_POSITIVE_ANGLE = 2,
-  STATE_MOVE_TO_ZERO_ANGLE = 3
+  STATE_MOVE_TO_ZERO_ANGLE = 3,
+  STATE_STOPPED = 4,
+  STATE_SWINGING = 5,
+  STATE_CONTROL = 6
 } State;
 volatile State state = 0; // State variable for the main loop
 float target_angle = 0.0; // Target angle in degrees (upright position)
@@ -86,9 +91,10 @@ void loop()
 {
   if (timer3_cnt >= 5) // Check if 5 control periods have passed (10 ms)
   {
-    timer3_cnt = 0;                                                                              // Reset the counter
-    sprintf(uart_buffer, ">pa:%.2f,ma:%.2f,mt:%.2f\r\n", pole_angle, motor_angle, target_angle); // Convert the pole angle and motor angle to a string
-    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));                                  // Send the pole angle over UART
+    timer3_cnt = 0; // Reset the counter
+    sprintf(uart_buffer, ">pa:%.2f,pad:%.2f,ma:%.2f,mad:%.2f,mt:%.2f\r\n",
+            pole_angle, pole_angle_d, motor_angle, motor_angle_d, target_angle); // Convert the pole angle and motor angle to a string
+    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));                  // Send the pole angle over UART
   }
   __WFI(); // Wait for interrupt
 }
@@ -98,7 +104,7 @@ void periodic_task()
   NRF_P1->OUTSET = (1 << 2); // Turn on LED
 
   read_AS5600_angle_deg(); // Read the angle in degrees from AS5600 and update the pole_angle variable
-  read_QDEC(); // Read the QDEC value and update the motor_encoder_count variable
+  read_QDEC();             // Read the QDEC value and update the motor_encoder_count variable
 
   if (state == STATE_INIT)
   {
@@ -111,15 +117,7 @@ void periodic_task()
     // set_GPIO_for_dir(1); // Stop the motor
     // set_PWM0_width(0, cnt / 100);
     // return;
-    state = STATE_MOVE_TO_NEGATIVE_ANGLE; // Change state to MOVE_TO_NEGATIVE_ANGLE when the button is pressed
-  }
-  else if (state == STATE_MOVE_TO_NEGATIVE_ANGLE)
-  {
-    target_angle = MOTOR_ANGLE_MIN; // Set the target angle to the minimum motor angle
-    if (motor_angle < MOTOR_ANGLE_MIN + 0.1)
-    {
-      state = STATE_MOVE_TO_POSITIVE_ANGLE; // Change state to MOVE_TO_POSITIVE_ANGLE when the motor angle is less than the minimum angle
-    }
+    state = STATE_MOVE_TO_POSITIVE_ANGLE; // Change state to MOVE_TO_POSITIVE_ANGLE when the button is pressed
   }
   else if (state == STATE_MOVE_TO_POSITIVE_ANGLE)
   {
@@ -129,9 +127,33 @@ void periodic_task()
       state = STATE_MOVE_TO_ZERO_ANGLE; // Change state to MOVE_TO_ZERO_ANGLE when the motor angle is greater than the maximum angle
     }
   }
+  else if (state == STATE_MOVE_TO_NEGATIVE_ANGLE)
+  {
+    target_angle = MOTOR_ANGLE_MIN; // Set the target angle to the minimum motor angle
+    if (motor_angle < MOTOR_ANGLE_MIN + 0.1)
+    {
+      state = STATE_MOVE_TO_ZERO_ANGLE; // Change state to MOVE_TO_ZERO_ANGLE when the motor angle is less than the minimum angle
+    }
+  }
   else if (state == STATE_MOVE_TO_ZERO_ANGLE)
   {
     target_angle = 0.0; // Set the target angle to 0 degrees
+  }
+  else if (state == STATE_STOPPED)
+  {
+    set_GPIO_for_dir(0); // Stop the motor
+    set_PWM0_width(0, 0);
+    return; // Do nothing if the state is STOPPED
+  }
+  else if (state == STATE_SWINGING)
+  {
+    float energy = 0;
+  }
+  else if (state == STATE_CONTROL)
+  {
+    // Control state logic can be implemented here
+    // For now, we will just set the target angle to 0 degrees
+    target_angle = 0.0;
   }
   else
   {
@@ -337,7 +359,18 @@ void read_AS5600_angle_deg()
   {
     raw_angle_offset -= 4096; // Adjust the zero position to account for wrap-around
   }
-  pole_angle = (((float)raw_angle - raw_angle_zero + raw_angle_offset) / 4096.0) * 360.0; // Convert the raw angle to degrees
+
+  static float prev_pole_angle_arr[3] = {0};               // Store the previous pole angle for velocity calculation
+  static int prev_index = 0;                               // Store the previous index for velocity calculation
+  float prev_pole_angle = prev_pole_angle_arr[prev_index]; // Store the previous pole angle for velocity calculation
+  float prev_pole_angle_d = pole_angle_d;                  // Get the previous pole angle velocity from the array
+  float alpha = 0.8;                                       // Low-pass filter coefficient for angle velocity
+
+  pole_angle = (((float)raw_angle - raw_angle_zero + raw_angle_offset) / 4096.0) * 360.0;                                         // Convert the raw angle to degrees
+  pole_angle_d = (1.0 - alpha) * (pole_angle - prev_pole_angle) / (control_period_ms * 3.0 / 1000.0) + alpha * prev_pole_angle_d; // Apply low-pass filter to angle velocity
+
+  prev_pole_angle_arr[prev_index] = pole_angle; // Store the current pole angle velocity in the array
+  prev_index = (prev_index + 1) % 3;            // Update the index for the next velocity calculation
 }
 
 void setup_UART()
@@ -378,10 +411,21 @@ void setup_QDEC()
 void read_QDEC()
 {
   // Read the accumulated count from the QDEC
-  NRF_QDEC->TASKS_READCLRACC = 1;                                             // Trigger the READCLRACC task to read and clear the accumulated count
-  int32_t acc = (int32_t)NRF_QDEC->ACCREAD;                                   // Read the accumulated count
-  motor_encoder_count += acc;                                                 // Update the global variable with the current count
-  motor_angle = ((float)motor_encoder_count / pulses_per_revolution) * 360.0; // Convert the count to degrees
+  NRF_QDEC->TASKS_READCLRACC = 1;           // Trigger the READCLRACC task to read and clear the accumulated count
+  int32_t acc = (int32_t)NRF_QDEC->ACCREAD; // Read the accumulated count
+  motor_encoder_count += acc;               // Update the global variable with the current count
+
+  static float prev_motor_angle_arr[3] = {0};                // Store the previous motor angle for velocity calculation
+  static int prev_index = 0;                                 // Store the previous index for velocity calculation
+  float prev_motor_angle = prev_motor_angle_arr[prev_index]; // Store the previous motor angle for velocity calculation
+  float prev_motor_angle_d = motor_angle_d;                  // Get the previous motor angle velocity from the array
+  float alpha = 0.8;                                         // Low-pass filter coefficient for angle velocity
+
+  motor_angle = ((float)motor_encoder_count / pulses_per_revolution) * 360.0;                                                         // Convert the count to degrees
+  motor_angle_d = (1.0 - alpha) * (motor_angle - prev_motor_angle) / (control_period_ms * 3.0 / 1000.0) + alpha * prev_motor_angle_d; // Apply low-pass filter to angle velocity
+
+  prev_motor_angle_arr[prev_index] = motor_angle; // Store the current motor angle velocity in the array
+  prev_index = (prev_index + 1) % 3;              // Update the index for the next velocity calculation
 }
 
 void TIMER3_IRQHandler(void)
