@@ -2,6 +2,7 @@
 #include <nrf52840_bitfields.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 // #include <Arduino.h>
 
 #define PWM_RAM_POLARITY_Pos (15UL)
@@ -15,7 +16,7 @@ void setup_PWM0();
 void set_PWM0_width(uint8_t channel, uint16_t width);
 void setup_GPIO_for_dir();
 void set_GPIO_for_dir(int8_t dir);
-const uint16_t PWM_MIN_WIDTH = 70;   // Minimum PWM width (7% duty cycle)
+const uint16_t PWM_MIN_WIDTH = 80;   // Minimum PWM width (8% duty cycle)
 const uint16_t PWM_MAX_WIDTH = 1000; // Maximum PWM width (100% duty cycle)
 
 #define AS5600_ADDRESS 0x36 // I2C address of AS5600
@@ -27,28 +28,32 @@ void my_i2c_read(uint8_t address, uint8_t *data, uint8_t length);
 void my_i2c_read_register(uint8_t address, uint8_t reg, uint8_t *data, uint8_t length);
 void setup_AS5600();                   // Function to setup AS5600
 void read_AS5600_raw_angle();          // Function to read the raw angle from AS5600 and update the raw_angle variable
-void read_AS5600_angle_deg();          // Function to read the angle in degrees from AS5600 and update the pole_angle variable
+void read_AS5600_angle();              // Function to read the angle in degrees from AS5600 and update the pole_angle variable
 volatile uint16_t raw_angle = 0;       // Raw angle value from AS5600
 volatile uint16_t raw_angle_zero = 0;  // Raw angle value from AS5600 at zero position
 volatile int32_t raw_angle_offset = 0; // Raw angle offset value from AS5600
-volatile float pole_angle = 0.0;       // Angle in degrees from AS5600
-volatile float pole_angle_d = 0.0;     // Angle velocity in degrees per second from AS5600
+volatile float pole_angle = 0.0;       // Angle in Radians from AS5600
+volatile float pole_angle_d = 0.0;     // Angle velocity in radians per second from AS5600
 
 #define MOTOR_ENCODER_INTERRUPT_PIN_A 21 // P0.21
 #define MOTOR_ENCODER_INTERRUPT_PIN_B 23 // P0.23
 void setup_QDEC();
-void read_QDEC();                          // Function to read the QDEC value and update the motor_encoder_count variable
-volatile int32_t motor_encoder_count = 0;  // Count of motor encoder pulses
-const int32_t pulses_per_revolution = 825; // Number of pulses(steps) per revolution
-volatile float motor_angle = 0.0;          // Angle in degrees from motor encoder
-volatile float motor_angle_d = 0.0;        // Angle velocity in degrees per second from motor encoder
-const float MOTOR_ANGLE_MIN = -45.0;       // Minimum angle in degrees from motor encoder
-const float MOTOR_ANGLE_MAX = 45.0;        // Maximum angle in degrees from motor encoder
+void read_QDEC();                                 // Function to read the QDEC value and update the motor_encoder_count variable
+volatile int32_t motor_encoder_count = 0;         // Count of motor encoder pulses
+const int32_t pulses_per_revolution = 825;        // Number of pulses(steps) per revolution
+volatile float motor_angle = 0.0;                 // Angle in radians from motor encoder
+volatile float motor_angle_d = 0.0;               // Angle velocity in radians per second from motor encoder
+const float MOTOR_ANGLE_MIN = -30 * M_PI / 180.0; // Minimum angle in radians from motor encoder (-30 degrees)
+const float MOTOR_ANGLE_MAX = 30 * M_PI / 180.0;  // Maximum angle in radians from motor encoder (30 degrees)
 
 const int control_period_ms = 2; // Control period in milliseconds
 void setup_timer3_for_control_period();
 void periodic_task();            // Function to be called every control_period_ms milliseconds
 volatile uint8_t timer3_cnt = 0; // Counter for Timer3 interrupts
+volatile float pid_output = 0.0; // PID output variable
+volatile float p_term = 0.0;     // Proportional term variable
+volatile float i_term = 0.0;     // Integral term variable
+volatile float d_term = 0.0;     // Derivative term variable
 
 char uart_buffer[64]; // Buffer for UART data
 void setup_UART();
@@ -56,6 +61,12 @@ void my_uart_write(uint8_t *data, uint8_t length);
 
 #define BUTTON_PIN 27 // P0.27
 void setup_GPIO_interrupt_for_button();
+
+void setup_ADC();
+void read_ADC();
+#define ADC0_PIN 2                   // P0.04
+#define ADC1_PIN 3                   // P0.05
+volatile int16_t adc_value[2] = {0}; // ADC values from the potentiometer
 
 typedef enum _State
 {
@@ -67,8 +78,11 @@ typedef enum _State
   STATE_SWINGING = 5,
   STATE_CONTROL = 6
 } State;
-volatile State state = 0; // State variable for the main loop
-float target_angle = 0.0; // Target angle in degrees (upright position)
+volatile State state = 0;          // State variable for the main loop
+volatile float target_angle = 0.0; // Target angle in degrees (upright position)
+
+volatile float Kp_control = 1400.0; // Proportional gain for control
+volatile float Kd_control = 50.0;   // Derivative gain for control
 
 void setup()
 {
@@ -80,11 +94,14 @@ void setup()
   setup_QDEC();
   setup_timer3_for_control_period();
   setup_GPIO_interrupt_for_button();
+  setup_ADC();
   NRF_P1->PIN_CNF[2] = (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
                        (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
                        (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
                        (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
                        (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos); // Set P1.02 as output for LED
+
+  // my_uart_write((uint8_t *)"pa,pad,ma,mad,mt,pid_output\r\n", strlen("pa,pad,ma,mad,mt,pid_output\r\n")); // Send initialization message over UART
 }
 
 void loop()
@@ -92,9 +109,11 @@ void loop()
   if (timer3_cnt >= 5) // Check if 5 control periods have passed (10 ms)
   {
     timer3_cnt = 0; // Reset the counter
-    sprintf(uart_buffer, ">pa:%.2f,pad:%.2f,ma:%.2f,mad:%.2f,mt:%.2f\r\n",
-            pole_angle, pole_angle_d, motor_angle, motor_angle_d, target_angle); // Convert the pole angle and motor angle to a string
-    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));                  // Send the pole angle over UART
+    // sprintf(uart_buffer, ">pa:%.2f,pad:%.2f,ma:%.2f,mad:%.2f,mt:%.2f,pid_output:%.2f\r\n",
+    //         pole_angle, pole_angle_d, motor_angle, motor_angle_d, target_angle, pid_output); // Convert the pole angle and motor angle to a string
+    sprintf(uart_buffer, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+            pole_angle * 180.0 / M_PI, pole_angle_d * 180.0 / M_PI, motor_angle * 180.0 / M_PI, motor_angle_d * 180.0 / M_PI, target_angle, pid_output, p_term, d_term, Kp_control, Kd_control); // Convert the pole angle and motor angle to a string
+    my_uart_write((uint8_t *)uart_buffer, strlen(uart_buffer));                                                                                                                                  // Send the pole angle over UART
   }
   __WFI(); // Wait for interrupt
 }
@@ -103,8 +122,12 @@ void periodic_task()
 {
   NRF_P1->OUTSET = (1 << 2); // Turn on LED
 
-  read_AS5600_angle_deg(); // Read the angle in degrees from AS5600 and update the pole_angle variable
-  read_QDEC();             // Read the QDEC value and update the motor_encoder_count variable
+  read_AS5600_angle(); // Read the angle in degrees from AS5600 and update the pole_angle variable
+  read_QDEC();         // Read the QDEC value and update the motor_encoder_count variable
+  read_ADC();          // Read the ADC values and update the adc_value array
+
+  Kp_control = 0.9 * Kp_control + 0.1 * (float)adc_value[0] / 4096.0 * 3000.0; // Update the proportional gain based on the potentiometer value
+  Kd_control = 0.9 * Kd_control + 0.1 * (float)adc_value[1] / 4096.0 * 500.0;  // Update the derivative gain based on the potentiometer value
 
   if (state == STATE_INIT)
   {
@@ -116,8 +139,10 @@ void periodic_task()
     // cnt++;
     // set_GPIO_for_dir(1); // Stop the motor
     // set_PWM0_width(0, cnt / 100);
-    // return;
-    state = STATE_MOVE_TO_POSITIVE_ANGLE; // Change state to MOVE_TO_POSITIVE_ANGLE when the button is pressed
+
+    // state = STATE_MOVE_TO_POSITIVE_ANGLE; // Change state to MOVE_TO_POSITIVE_ANGLE when the button is pressed
+
+    state = STATE_CONTROL; // Change state to CONTROL when the button is pressed
   }
   else if (state == STATE_MOVE_TO_POSITIVE_ANGLE)
   {
@@ -141,60 +166,108 @@ void periodic_task()
   }
   else if (state == STATE_STOPPED)
   {
+    p_term = 0.0;
+    i_term = 0.0;
+    d_term = 0.0;
+    pid_output = 0.0;
     set_GPIO_for_dir(0); // Stop the motor
     set_PWM0_width(0, 0);
-    return; // Do nothing if the state is STOPPED
   }
   else if (state == STATE_SWINGING)
   {
-    float energy = 0;
+    static uint16_t cnt = 0;
+
+    if ((cnt & 1) == 0)
+    {
+      target_angle = MOTOR_ANGLE_MAX;                                         // Set the target angle to the maximum motor angle
+      if (motor_angle > MOTOR_ANGLE_MAX - 0.1 && pole_angle > M_PI / 6 * cnt) //
+      {
+        cnt += 1; // Increment the counter when the motor angle is greater than the maximum angle
+      }
+    }
+    else if ((cnt & 1) == 1)
+    {
+      target_angle = MOTOR_ANGLE_MIN; // Set the target angle to the minimum motor angle
+      if (motor_angle < MOTOR_ANGLE_MIN + 0.1 && pole_angle < -M_PI / 6 * cnt)
+      {
+        cnt += 1; // Increment the counter when the motor angle is greater than the maximum angle
+      }
+    }
+    // else if (cnt == 2)
+    // {
+    //   target_angle = 0.0; // Set the target angle to 0 degrees
+    if (fabs(pole_angle - M_PI) < M_PI / 3)
+    {
+      state = STATE_CONTROL; // Change state to CONTROL when the pole angle is close to 0 degrees
+      cnt = 0;               // Reset the counter
+    }
+    // }
+
+    float error = target_angle - motor_angle; // Calculate the error between the motor angle and target angle
+
+    float Kp = 250.0; // Proportional gain
+
+    pid_output = Kp * error; // Calculate the PID output
   }
   else if (state == STATE_CONTROL)
   {
-    // Control state logic can be implemented here
-    // For now, we will just set the target angle to 0 degrees
-    target_angle = 0.0;
+    target_angle = M_PI;                     // Set the target angle to 180 degrees (pi radians)
+    float error = target_angle - pole_angle; // Calculate the error between the pole angle and target angle
+    float derivative = 0;                    // Calculate the derivative of the error
+    static float integral = 0;               // Calculate the integral of the error
+
+    derivative = -pole_angle_d;
+    integral += error * (control_period_ms / 1000.0); // Calculate the integral of the error
+
+    float Kp = Kp_control; // Proportional gain
+    float Kd = Kd_control; // Derivative gain
+    float Ki = 0.0;        // Integral gain
+
+    p_term = Kp * error;      // Calculate the proportional term
+    d_term = Kd * derivative; // Calculate the derivative term
+    i_term = Ki * integral;   // Calculate the integral term
+
+    pid_output = p_term + d_term + i_term; // Calculate the PID output
+
+    if (motor_angle < MOTOR_ANGLE_MIN || motor_angle > MOTOR_ANGLE_MAX ||
+        pole_angle < M_PI / 2 || pole_angle > 3 * M_PI / 2) // Check if the motor angle is out of bounds
+    {
+      target_angle = 0.0;    // Reset the target angle to 0 degrees when the motor angle is out of bounds
+      pid_output = 0;        // Stop the motor when the motor angle is out of bounds
+      state = STATE_STOPPED; // Change state to STOPPED when the motor angle is out of bounds
+    }
+
+    if (fabs(error) < M_PI / 180.0) // Check if the error is less than 1 degrees
+    {
+      pid_output = 0; // Stop the motor when the error is less than 1 degrees
+    }
   }
   else
   {
     set_GPIO_for_dir(0); // Stop the motor
     set_PWM0_width(0, 0);
-    return; // Do nothing if the state is undefined
   }
 
-  float error = target_angle - motor_angle;                             // Calculate the error between the pole angle and motor angle
-  float derivative = 0;                                                 // Calculate the derivative of the error
-  static float previous_error = 0;                                      // Store the previous error for derivative calculation
-  derivative = (error - previous_error) / (control_period_ms / 1000.0); // Calculate the derivative of the error
-  previous_error = error;                                               // Update the previous error
-  float integral = 0;                                                   // Calculate the integral of the error
-  static float previous_integral = 0;                                   // Store the previous integral for integral calculation
-  integral = previous_integral + error * (control_period_ms / 1000.0);  // Calculate the integral of the error
-  previous_integral = integral;                                         // Update the previous integral
-
-  float Kp = 10.0; // Proportional gain
-  float Kd = 0.5;  // Derivative gain
-  float Ki = 0.0;  // Integral gain
-
-  float pid_output = Kp * error + Kd * derivative + Ki * integral;
-
-  uint32_t pwm_value = 0; // Calculate the PWM value based on the error
-
-  if (pid_output > 0)
+  // if (state == STATE_MOVE_TO_POSITIVE_ANGLE || state == STATE_MOVE_TO_NEGATIVE_ANGLE || state == STATE_MOVE_TO_ZERO_ANGLE || state == STATE_CONTROL)
   {
-    set_GPIO_for_dir(1);              // Set the direction of the motor
-    pwm_value = (uint16_t)pid_output; // Set the PWM value based on the error
-  }
-  else
-  {
-    set_GPIO_for_dir(-1);                // Set the direction of the motor
-    pwm_value = (uint16_t)(-pid_output); // Set the PWM value based on the error
-  }
+    uint32_t pwm_value = 0; // Calculate the PWM value based on the error
 
-  pwm_value = (pwm_value > PWM_MAX_WIDTH) ? PWM_MAX_WIDTH : pwm_value;              // Limit the PWM value to the maximum value of the counter
-  pwm_value = (pwm_value && pwm_value < PWM_MIN_WIDTH) ? PWM_MIN_WIDTH : pwm_value; // Limit the PWM value to the minimum value of the counter
+    if (pid_output > 0)
+    {
+      set_GPIO_for_dir(1);              // Set the direction of the motor
+      pwm_value = (uint16_t)pid_output; // Set the PWM value based on the error
+    }
+    else
+    {
+      set_GPIO_for_dir(-1);                // Set the direction of the motor
+      pwm_value = (uint16_t)(-pid_output); // Set the PWM value based on the error
+    }
 
-  set_PWM0_width(0, pwm_value); // Set the PWM width for channel 0
+    pwm_value = (pwm_value > PWM_MAX_WIDTH) ? PWM_MAX_WIDTH : pwm_value;              // Limit the PWM value to the maximum value of the counter
+    pwm_value = (pwm_value && pwm_value < PWM_MIN_WIDTH) ? PWM_MIN_WIDTH : pwm_value; // Limit the PWM value to the minimum value of the counter
+
+    set_PWM0_width(0, pwm_value); // Set the PWM width for channel 0
+  }
 
   NRF_P1->OUTCLR = (1 << 2); // Turn off LED
 }
@@ -332,12 +405,12 @@ void my_i2c_read_register(uint8_t address, uint8_t reg, uint8_t *data, uint8_t l
 void setup_AS5600()
 {
   uint32_t angle_sum = 0;
-  for (size_t i = 0; i < 10; i++)
+  for (size_t i = 0; i < 100; i++)
   {
     read_AS5600_raw_angle(); // Read the raw angle from AS5600 and update the raw_angle variable
     angle_sum += raw_angle;  // Accumulate the raw angle values
   }
-  raw_angle_zero = angle_sum / 10; // Calculate the average raw angle value for zero position
+  raw_angle_zero = angle_sum / 100; // Calculate the average raw angle value for zero position
 }
 
 void read_AS5600_raw_angle()
@@ -347,7 +420,7 @@ void read_AS5600_raw_angle()
   raw_angle = ((tmp_raw_angle[1]) | ((uint16_t)tmp_raw_angle[0] << 8)) & 0x0FFF; // Convert from big-endian to little-endian
 }
 
-void read_AS5600_angle_deg()
+void read_AS5600_angle()
 {
   uint16_t prev_raw_angle = raw_angle;
   read_AS5600_raw_angle();                                             // Read the raw angle from AS5600 and update the raw_angle variable
@@ -360,17 +433,17 @@ void read_AS5600_angle_deg()
     raw_angle_offset -= 4096; // Adjust the zero position to account for wrap-around
   }
 
-  static float prev_pole_angle_arr[3] = {0};               // Store the previous pole angle for velocity calculation
+  static float prev_pole_angle_arr[5] = {0};               // Store the previous pole angle for velocity calculation
   static int prev_index = 0;                               // Store the previous index for velocity calculation
   float prev_pole_angle = prev_pole_angle_arr[prev_index]; // Store the previous pole angle for velocity calculation
   float prev_pole_angle_d = pole_angle_d;                  // Get the previous pole angle velocity from the array
   float alpha = 0.8;                                       // Low-pass filter coefficient for angle velocity
 
-  pole_angle = (((float)raw_angle - raw_angle_zero + raw_angle_offset) / 4096.0) * 360.0;                                         // Convert the raw angle to degrees
-  pole_angle_d = (1.0 - alpha) * (pole_angle - prev_pole_angle) / (control_period_ms * 3.0 / 1000.0) + alpha * prev_pole_angle_d; // Apply low-pass filter to angle velocity
+  pole_angle = (((float)raw_angle - raw_angle_zero + raw_angle_offset) / 4096.0) * 2.0 * M_PI;                                    // Convert the raw angle to radians
+  pole_angle_d = (1.0 - alpha) * (pole_angle - prev_pole_angle) / (control_period_ms * 5.0 / 1000.0) + alpha * prev_pole_angle_d; // Apply low-pass filter to angle velocity
 
   prev_pole_angle_arr[prev_index] = pole_angle; // Store the current pole angle velocity in the array
-  prev_index = (prev_index + 1) % 3;            // Update the index for the next velocity calculation
+  prev_index = (prev_index + 1) % 5;            // Update the index for the next velocity calculation
 }
 
 void setup_UART()
@@ -415,17 +488,17 @@ void read_QDEC()
   int32_t acc = (int32_t)NRF_QDEC->ACCREAD; // Read the accumulated count
   motor_encoder_count += acc;               // Update the global variable with the current count
 
-  static float prev_motor_angle_arr[3] = {0};                // Store the previous motor angle for velocity calculation
+  static float prev_motor_angle_arr[5] = {0};                // Store the previous motor angle for velocity calculation
   static int prev_index = 0;                                 // Store the previous index for velocity calculation
   float prev_motor_angle = prev_motor_angle_arr[prev_index]; // Store the previous motor angle for velocity calculation
   float prev_motor_angle_d = motor_angle_d;                  // Get the previous motor angle velocity from the array
   float alpha = 0.8;                                         // Low-pass filter coefficient for angle velocity
 
-  motor_angle = ((float)motor_encoder_count / pulses_per_revolution) * 360.0;                                                         // Convert the count to degrees
-  motor_angle_d = (1.0 - alpha) * (motor_angle - prev_motor_angle) / (control_period_ms * 3.0 / 1000.0) + alpha * prev_motor_angle_d; // Apply low-pass filter to angle velocity
+  motor_angle = ((float)motor_encoder_count / pulses_per_revolution) * 2.0 * M_PI;                                                    // Convert the count to radians
+  motor_angle_d = (1.0 - alpha) * (motor_angle - prev_motor_angle) / (control_period_ms * 5.0 / 1000.0) + alpha * prev_motor_angle_d; // Apply low-pass filter to angle velocity
 
   prev_motor_angle_arr[prev_index] = motor_angle; // Store the current motor angle velocity in the array
-  prev_index = (prev_index + 1) % 3;              // Update the index for the next velocity calculation
+  prev_index = (prev_index + 1) % 5;              // Update the index for the next velocity calculation
 }
 
 void TIMER3_IRQHandler(void)
@@ -482,4 +555,75 @@ void setup_GPIO_interrupt_for_button()
   NVIC_SetPriority(GPIOTE_IRQn, 2);                                                // Set priority for GPIOTE interrupt
   __NVIC_SetVector(GPIOTE_IRQn, (uint32_t)my_GPIOTE_IRQHandler);                   // Set the interrupt vector for GPIOTE
   NVIC_EnableIRQ(GPIOTE_IRQn);                                                     // Enable GPIOTE interrupt in NVIC
+}
+
+void setup_ADC()
+{
+  NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit << SAADC_RESOLUTION_VAL_Pos;                // Set resolution to 12 bits
+  NRF_SAADC->OVERSAMPLE = SAADC_OVERSAMPLE_OVERSAMPLE_Bypass << SAADC_OVERSAMPLE_OVERSAMPLE_Pos; // Set oversample to bypass
+  NRF_SAADC->SAMPLERATE = SAADC_SAMPLERATE_MODE_Task << SAADC_SAMPLERATE_MODE_Pos;               // Set sample rate to task mode
+
+  NRF_SAADC->RESULT.PTR = (uint32_t)adc_value;                         // Set the pointer to the ADC result buffer
+  NRF_SAADC->RESULT.MAXCNT = sizeof(adc_value) / sizeof(adc_value[0]); // Set the maximum number of samples to read
+
+  // Configure channel 0 for ADC0_PIN (P0.04)
+  NRF_P0->PIN_CNF[4] = (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) |
+                       (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
+                       (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
+                       (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
+                       (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos); // Configure ADC0_PIN as input
+  NRF_SAADC->CH[0].PSELN = SAADC_CH_PSELN_PSELN_NC << SAADC_CH_PSELN_PSELN_Pos; // No negative input
+  NRF_SAADC->CH[0].PSELP = SAADC_CH_PSELP_PSELP_AnalogInput2;                   // Set positive input to AIN2 (P0.04)
+  NRF_SAADC->CH[0].CONFIG = (SAADC_CH_CONFIG_RESP_Bypass << SAADC_CH_CONFIG_RESP_Pos) |
+                            (SAADC_CH_CONFIG_RESN_Bypass << SAADC_CH_CONFIG_RESN_Pos) |
+                            (SAADC_CH_CONFIG_GAIN_Gain1_6 << SAADC_CH_CONFIG_GAIN_Pos) |
+                            (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos) |
+                            (SAADC_CH_CONFIG_TACQ_40us << SAADC_CH_CONFIG_TACQ_Pos) |
+                            (SAADC_CH_CONFIG_MODE_SE << SAADC_CH_CONFIG_MODE_Pos) |
+                            (SAADC_CH_CONFIG_BURST_Disabled << SAADC_CH_CONFIG_BURST_Pos); // Configure channel 0 settings
+
+  // Configure channel 1 for ADC1_PIN (P0.05)
+  NRF_P0->PIN_CNF[5] = (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) |
+                       (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
+                       (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
+                       (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
+                       (GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos); // Configure ADC1_PIN as input
+  NRF_SAADC->CH[1].PSELN = SAADC_CH_PSELN_PSELN_NC << SAADC_CH_PSELN_PSELN_Pos; // No negative input
+  NRF_SAADC->CH[1].PSELP = SAADC_CH_PSELP_PSELP_AnalogInput3;                   // Set positive input to AIN3 (P0.05)
+  NRF_SAADC->CH[1].CONFIG = (SAADC_CH_CONFIG_RESP_Bypass << SAADC_CH_CONFIG_RESP_Pos) |
+                            (SAADC_CH_CONFIG_RESN_Bypass << SAADC_CH_CONFIG_RESN_Pos) |
+                            (SAADC_CH_CONFIG_GAIN_Gain1_6 << SAADC_CH_CONFIG_GAIN_Pos) |
+                            (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos) |
+                            (SAADC_CH_CONFIG_TACQ_40us << SAADC_CH_CONFIG_TACQ_Pos) |
+                            (SAADC_CH_CONFIG_MODE_SE << SAADC_CH_CONFIG_MODE_Pos) |
+                            (SAADC_CH_CONFIG_BURST_Disabled << SAADC_CH_CONFIG_BURST_Pos); // Configure channel 1 settings
+
+  NRF_SAADC->ENABLE = (SAADC_ENABLE_ENABLE_Enabled << SAADC_ENABLE_ENABLE_Pos); // Enable the SAADC
+
+  NRF_SAADC->TASKS_CALIBRATEOFFSET = 1; // Start offset calibration
+  while (NRF_SAADC->EVENTS_CALIBRATEDONE == 0)
+    ;                                  // Wait for calibration to complete
+  NRF_SAADC->EVENTS_CALIBRATEDONE = 0; // Clear the calibration done event
+}
+
+void read_ADC()
+{
+  NRF_SAADC->TASKS_START = 1; // Start the ADC
+  while (NRF_SAADC->EVENTS_STARTED == 0)
+    ;                            // Wait for the ADC to start
+  NRF_SAADC->EVENTS_STARTED = 0; // Clear the started event
+
+  NRF_SAADC->TASKS_SAMPLE = 1; // Trigger a sample
+  // while (NRF_SAADC->EVENTS_RESULTDONE == 0)
+  //   ;                               // Wait for the sample to complete
+  // NRF_SAADC->EVENTS_RESULTDONE = 0; // Clear the result done event
+  // NRF_SAADC->TASKS_SAMPLE = 1;      // Trigger a sample
+  while (NRF_SAADC->EVENTS_END == 0)
+    ;                        // Wait for the ADC to start
+  NRF_SAADC->EVENTS_END = 0; // Clear the end event
+
+  NRF_SAADC->TASKS_STOP = 1; // Stop the ADC
+  while (NRF_SAADC->EVENTS_STOPPED == 0)
+    ;                            // Wait for the ADC to stop
+  NRF_SAADC->EVENTS_STOPPED = 0; // Clear the stopped event
 }
